@@ -1,0 +1,9 @@
+pdf2image
+reportlab
+jinja2
+faker
+opencv-python-headless
+albumentations
+imgaug
+pydantic
+rich
