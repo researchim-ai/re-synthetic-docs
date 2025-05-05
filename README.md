@@ -1,125 +1,121 @@
-Thought for a couple of seconds
+Thought for a few seconds
 
 
-```markdown
+````markdown
 # SyntheticDocs
 
-**_An end-to-end toolkit for generating synthetic scanned A4 documents with signatures, stamps, and OCR-style noise for VLM/LLM training._**
+**An end-to-end toolkit for generating synthetic “scanned” A4 documents with signatures, stamps, and scanner artifacts, for VLM/LLM training.**
 
-> **❗️ Research‐only:** This project is intended _exclusively_ for research and evaluation purposes. Generated documents should **not** be used for any real-world or production scenarios, nor for deceptive or fraudulent activities.
+> ❗️ **Research-only:** This project is intended **exclusively** for research and evaluation. Generated documents **must not** be used in any real-world or production scenarios, nor for deceptive or fraudulent activities.
 
 ---
 
 ## Features
 
-- **LLM-driven text generation** via [vLLM](https://github.com/vllm-project/vllm) + Hugging Face models  
-- **Template‐based prompts** loaded from `prompts.json` for multiple document types  
-- **Custom Cyrillic font** support for realistic Russian text  
-- **Signature & stamp overlays** with automatic scaling & transparency  
-- **Scanner effects** (perspective warp, blur, JPEG artifacts, noise) via Albumentations  
-- **Output:**  
-  - Multi‐page PDF (`.pdf`)  
-  - High‐res PNG scan (`.png`, 300 DPI)  
-  - Metadata JSON (`.json`) with bounding boxes and raw LLM text  
+- **LLM-driven text** via local vLLM + Hugging Face models  
+- **Template-based prompts** loaded from `prompts.json` for multiple document types  
+- **Cyrillic font support** for realistic Russian text in PDFs  
+- **Signature & stamp overlays** with automatic scaling and alpha transparency  
+- **Scanner artifacts** (perspective warp, blur, JPEG-style compression, noise) via Albumentations  
+- **Outputs**:  
+  - `.pdf` — original document  
+  - `.png` — high-res “scan” at 300 DPI  
+  - `.json` — metadata (bounding boxes + raw LLM text)  
 
 ---
 
-## Repository Structure
+## Project Structure
 
-```
-
+```text
 re-synthetic-docs/
 ├── assets/
 │   ├── signatures/
-│   │   ├── fonts/               # .ttf fonts for signature generation
-│   │   └── png/                 # existing signature PNGs
+│   │   ├── fonts/        # .ttf fonts for signature generation
+│   │   └── png/          # signature PNGs (alpha channel)
 │   └── stamps/
-│       ├── fonts/               # .ttf fonts for stamp generation
-│       └── png/                 # existing stamp PNGs
-├── prompts.json                # Prompt templates per document type
-├── make\_signatures.py          # Script to generate signature PNGs via fonts
-├── make\_stamps.py              # Script to generate circular stamp PNGs
-├── syntheticdocs.py            # Main generator: LLM → PDF → PNG → metadata
-└── requirements.txt            # Python dependencies
-
+│       ├── fonts/        # .ttf fonts for stamp generation
+│       └── png/          # stamp PNGs (alpha channel)
+├── prompts.json          # JSON templates for each document type
+├── make_signatures.py    # script to generate signature PNGs from fonts
+├── make_stamps.py        # script to generate circular stamp PNGs
+├── syntheticdocs.py      # main generator: LLM → PDF → PNG → metadata
+└── requirements.txt      # Python dependencies
 ````
 
 ---
 
-## Getting Started
-
-### 1. Clone & Install
+## Installation
 
 ```bash
 git clone https://github.com/your-org/re-synthetic-docs.git
 cd re-synthetic-docs
 
-# Create & activate virtualenv (optional)
+# (optional) Create and activate a virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
 pip install --upgrade pip
 pip install -r requirements.txt
-````
+```
 
-> **Note:**
+> **Notes:**
 >
-> * Requires Python 3.10+
-> * For GPU acceleration, install the appropriate `torch`+CUDA build before `vllm`.
-> * `poppler-utils` (for `pdftoppm`) may be needed on Linux:
+> * Requires **Python 3.10+**.
+> * For GPU acceleration, install a compatible `torch` + CUDA build **before** installing `vllm`.
+> * On Linux, you may need `poppler-utils` for PDF→PNG conversion:
 >
 >   ```bash
 >   sudo apt update && sudo apt install -y poppler-utils
 >   ```
 
-### 2. Prepare Assets
+---
+
+## Preparing Assets
 
 1. **Fonts**
+   Place at least one Cyrillic-capable `.ttf` in
+   `assets/signatures/fonts/` and `assets/stamps/fonts/`.
 
-   * Place at least one Cyrillic‐capable `.ttf` into `assets/signatures/fonts/` and `assets/stamps/fonts/`.
-
-2. **Generate Signatures (optional)**
+2. **Generate signatures** (optional)
 
    ```bash
    python make_signatures.py
    ```
 
-   * Produces \~500 `.png` signatures in `assets/signatures/png/`.
+   — will produce \~500 PNG signatures in `assets/signatures/png/`.
 
-3. **Generate Stamps (optional)**
+3. **Generate stamps** (optional)
 
    ```bash
    python make_stamps.py
    ```
 
-   * Produces \~30 circular stamp PNGs in `assets/stamps/png/`.
+   — will produce \~30 PNG stamps in `assets/stamps/png/`.
 
-### 3. Configure Prompts
+---
 
-* Open `prompts.json` to review or customize prompt templates for each document type.
-* Templates use Python-style `{field}` placeholders.
-
-### 4. Run the Generator
+## Usage
 
 ```bash
 python syntheticdocs.py \
-  --model   "/path/to/your/hf-model-or-repo" \
-  --font    assets/signatures/fonts/YourCyrillicFont.ttf \
+  --model     "/path/to/model-or-repo-id" \
+  --font      assets/signatures/fonts/YourCyrillicFont.ttf \
   --signatures assets/signatures/png \
-  --stamps  assets/stamps/png \
-  --out     out \
-  -n        10
+  --stamps    assets/stamps/png \
+  --out       out \
+  -n          10
 ```
 
-* **`--model`**: HF repo-ID (e.g. `mistralai/Mistral-7B-Instruct-v0.2`) or local model directory
-* **`--font`**: Path to your Cyrillic `.ttf` for PDF text
-* **`--signatures`**, **`--stamps`**: Directories with PNG overlays (α-channel)
-* **`--out`**: Output directory (will be created if missing)
-* **`-n`**: Number of documents to generate
+* **`--model`**      — Hugging Face repo-ID (e.g. `mistralai/Mistral-7B-Instruct-v0.2`) or local model directory
+* **`--font`**       — path to a `.ttf` font with Cyrillic support
+* **`--signatures`** — folder containing signature PNGs (alpha channel)
+* **`--stamps`**     — folder containing stamp PNGs (alpha channel)
+* **`--out`**        — output directory (created if missing)
+* **`-n`**           — number of documents to generate
 
-Each run produces:
+After running, `out/` will contain:
 
-```
+```text
 out/
 ├── <uuid1>.pdf
 ├── <uuid1>.png
@@ -130,14 +126,14 @@ out/
 └── …
 ```
 
-* **`<uuid>.pdf`**: Generated PDF
-* **`<uuid>.png`**: Synthetic “scanned” image (300 DPI)
-* **`<uuid>.json`**:
+* `<uuid>.pdf`  — generated PDF
+* `<uuid>.png`  — synthetic “scan” (300 DPI)
+* `<uuid>.json` — metadata:
 
   ```jsonc
   {
     "id": "<uuid>",
-    "type": "<doc_type>",
+    "type": "<document_type>",
     "text": "<raw LLM-generated text>",
     "bboxes": [
       { "type": "signature", "coords": [x0, y0, x1, y1] },
@@ -150,18 +146,17 @@ out/
 
 ## Customization & Extension
 
-* **Add document types**: Extend `prompts.json` with new keys & templates.
-* **Adjust scanner effects**: Tweak `aug = A.Compose([...])` in `syntheticdocs.py`.
-* **Multi-page support**: Modify `draw_pdf()` to add extra pages/fields.
-* **Parallel generation**: Integrate `asyncio` or batch calls in `vLLM`.
+* **Add document types**: extend `prompts.json` with new templates.
+* **Adjust scanner effects**: modify the Albumentations pipeline (`aug = A.Compose([...])`).
+* **Multi-page documents**: enhance `draw_pdf()` to add additional pages or fields.
+* **Parallel generation**: batch LLM requests or use `asyncio` for speed.
 
 ---
 
 ## License & Disclaimer
 
 This code is provided “as is” for **research purposes only**.
-Use at your own risk. The authors are not responsible for any misuse.
+The authors disclaim any liability for misuse.
 
----
-
-Happy experimenting! 🚀
+```
+```
