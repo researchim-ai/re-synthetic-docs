@@ -8,3 +8,4 @@ imgaug
 pydantic
 rich
 vllm
+openai

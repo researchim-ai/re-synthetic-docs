@@ -1,0 +1,32 @@
+{
+  "llm": {
+    "mode": "openai",
+    "base_url": "http://localhost:8000/v1",
+    "api_key": "OPENAI_API_KEY",
+    "model": "Qwen3-30B-A3B-AWQ",
+    "max_tokens": 8192,
+    "temperature": 0.7
+  },
+  "generator": {
+    "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "signatures_dir": "assets/signatures/png",
+    "stamps_dir": "assets/stamps/png",
+    "out_dir": "out",
+    "num": 10,
+    "seed": 42
+  },
+  "signatures": {
+    "fonts_dir": "assets/signatures/fonts",
+    "output_dir": "assets/signatures/png",
+    "num": 500,
+    "seed": 123,
+    "locale": "auto",
+    "font_size": { "min": 48, "max": 72 },
+    "padding": 20,
+    "rotation": { "min": -10, "max": 10 },
+    "border": { "min": 0, "max": 10 },
+    "blur": { "min": 0.0, "max": 0.8 }
+  }
+}
+
+

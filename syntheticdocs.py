@@ -6,7 +6,7 @@ import uuid
 import json
 import pathlib
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Callable, Dict, Any
 
 from faker import Faker
 from huggingface_hub import snapshot_download
@@ -36,7 +36,7 @@ aug = A.Compose([
     A.Perspective(scale=(0.02, 0.05), p=0.5),
     A.GaussianBlur(blur_limit=(1, 3), p=0.5),
     A.ImageCompression(p=0.5),
-    A.GaussNoise(sigma=(10.0, 50.0), p=0.5),
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
 ])
 
 def augment_image(img: Image.Image) -> Image.Image:
@@ -45,8 +45,22 @@ def augment_image(img: Image.Image) -> Image.Image:
     return Image.fromarray(arr2)
 
 # ---------------------------------------------------------------------------
-# LLM helper
+# Config + LLM helpers
 # ---------------------------------------------------------------------------
+def load_config(path: str) -> Dict[str, Any]:
+    cfg_path = pathlib.Path(path)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def resolve_path(path_like: str) -> pathlib.Path:
+    base = pathlib.Path(__file__).resolve().parent
+    p = pathlib.Path(path_like)
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    return p
+
 def prepare_llm(model_id: str, gpu_memory_util: float = 0.90) -> LLM:
     if os.path.isdir(model_id):
         local_dir = model_id
@@ -59,9 +73,59 @@ def prepare_llm(model_id: str, gpu_memory_util: float = 0.90) -> LLM:
         )
     return LLM(model=local_dir, dtype="half", gpu_memory_utilization=gpu_memory_util)
 
-def gen_text(llm: LLM, prompt: str, max_tokens: int = 512) -> str:
-    out = llm.generate([prompt], SamplingParams(max_tokens=max_tokens, temperature=0.8))
-    return out[0].outputs[0].text.strip()
+def make_text_generator(mode: str, params: Dict[str, Any]) -> Callable[[str], str]:
+    mode = (mode or "vllm").lower()
+    max_tokens = int(params.get("max_tokens", 512))
+    temperature = float(params.get("temperature", 0.8))
+
+    if mode == "vllm":
+        model_id = params.get("model")
+        if not model_id:
+            raise ValueError("For llm.mode='vllm' требуется указать 'model'")
+        llm = prepare_llm(model_id, gpu_memory_util=float(params.get("gpu_memory_util", 0.90)))
+        sampling = SamplingParams(max_tokens=max_tokens, temperature=temperature)
+
+        def _gen(prompt: str) -> str:
+            out = llm.generate([prompt], sampling)
+            return out[0].outputs[0].text.strip()
+
+        return _gen
+
+    if mode == "openai":
+        # Lazy import to avoid hard dependency at runtime if not used
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            raise RuntimeError("Требуется пакет 'openai' для режима openai. Установите его.") from e
+
+        base_url = params.get("base_url") or os.getenv("OPENAI_BASE_URL")
+        api_key = params.get("api_key")
+        api_key_env = params.get("api_key_env")
+        if not api_key and api_key_env:
+            api_key = os.getenv(api_key_env)
+        if not api_key:
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OpenAI API key не найден (передайте 'api_key' или 'api_key_env' или переменную окружения OPENAI_API_KEY)")
+
+        model_name = params.get("model")
+        if not model_name:
+            raise ValueError("Для llm.mode='openai' требуется указать 'model'")
+
+        client = OpenAI(base_url=base_url, api_key=api_key)
+
+        def _gen(prompt: str) -> str:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        return _gen
+
+    raise ValueError(f"Неизвестный режим LLM: {mode}")
 
 # ---------------------------------------------------------------------------
 # PDF rendering with signature & stamp
@@ -117,7 +181,7 @@ def draw_pdf(text: str, sig_png: str, stamp_png: str, out_pdf: str) -> (List[flo
 # Main generation
 # ---------------------------------------------------------------------------
 def generate_batch(
-    llm: LLM,
+    gen_text_fn: Callable[[str], str],
     n: int,
     sig_dir: pathlib.Path,
     stamp_dir: pathlib.Path,
@@ -174,7 +238,7 @@ def generate_batch(
 
         # Build prompt & generate
         prompt = tpl.format(**fields)
-        body   = gen_text(llm, prompt)
+        body   = gen_text_fn(prompt)
 
         # Paths
         uid    = uuid.uuid4().hex
@@ -216,41 +280,129 @@ def main():
         description="SyntheticDocs: генерирует PDF, PNG и JSON с метаданными",
     )
     parser.add_argument(
-        "-m", "--model", required=True,
-        help="HF repo-id или путь к локальной модели",
+        "--config",
+        help="Путь к JSON-конфигу",
     )
     parser.add_argument(
-        "--font", required=True,
-        help="Путь к TTF-шрифту с кириллицей",
+        "--llm-mode", choices=["vllm", "openai"], default=None,
+        help="Режим LLM: локальная vLLM или OpenAI-совместимый API",
     )
     parser.add_argument(
-        "--signatures", required=True,
-        help="Директория с PNG-подписями (alpha)",
+        "-m", "--model",
+        help="ID модели (HF repo-id/путь для vLLM или имя модели для OpenAI API)",
     )
     parser.add_argument(
-        "--stamps", required=True,
-        help="Директория с PNG-печатью (alpha)",
+        "--openai-base-url",
+        help="Базовый URL OpenAI-совместимого API (например http://localhost:8000/v1)",
     )
     parser.add_argument(
-        "-n", "--num", type=int, default=1,
-        help="Количество документов",
+        "--openai-api-key",
+        help="API-ключ для OpenAI-совместимого API",
     )
     parser.add_argument(
-        "-o", "--out", default="out",
-        help="Папка для вывода",
+        "--openai-api-key-env",
+        help="Имя переменной окружения с API-ключом",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Лимит токенов для LLM (перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=None,
+        help="Температура выборки (перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "--font",
+        help="Путь к TTF-шрифту с кириллицей (перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "--signatures",
+        help="Директория с PNG-подписями (alpha, перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "--stamps",
+        help="Директория с PNG-печатью (alpha, перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "-n", "--num", type=int,
+        help="Количество документов (перекрывает конфиг)",
+    )
+    parser.add_argument(
+        "-o", "--out",
+        help="Папка для вывода (перекрывает конфиг)",
     )
     args = parser.parse_args()
 
-    # Register the custom Cyrillic font
-    pdfmetrics.registerFont(TTFont("CustomFont", args.font))
+    # Optional config loading
+    cfg: Dict[str, Any] = {}
+    if args.config:
+        cfg = load_config(args.config)
 
-    llm = prepare_llm(args.model)
+    # Merge CLI over config
+    llm_cfg = dict(cfg.get("llm", {}))
+    if args.llm_mode is not None:
+        llm_cfg["mode"] = args.llm_mode
+    if args.model is not None:
+        llm_cfg["model"] = args.model
+    if args.openai_base_url is not None:
+        llm_cfg["base_url"] = args.openai_base_url
+    if args.openai_api_key is not None:
+        llm_cfg["api_key"] = args.openai_api_key
+    if args.openai_api_key_env is not None:
+        llm_cfg["api_key_env"] = args.openai_api_key_env
+    if args.max_tokens is not None:
+        llm_cfg["max_tokens"] = args.max_tokens
+    if args.temperature is not None:
+        llm_cfg["temperature"] = args.temperature
+
+    # Generator config (paths, counts, seed)
+    gen_cfg = dict(cfg.get("generator", {}))
+    if args.font is not None:
+        gen_cfg["font"] = args.font
+    if args.signatures is not None:
+        gen_cfg["signatures_dir"] = args.signatures
+    if args.stamps is not None:
+        gen_cfg["stamps_dir"] = args.stamps
+    if args.out is not None:
+        gen_cfg["out_dir"] = args.out
+    if args.num is not None:
+        gen_cfg["num"] = args.num
+
+    required_gen_keys = ["font", "signatures_dir", "stamps_dir", "out_dir"]
+    missing = [k for k in required_gen_keys if k not in gen_cfg or not gen_cfg[k]]
+    if missing:
+        raise SystemExit(
+            "Отсутствуют обязательные параметры генератора: " + ", ".join(missing) +
+            ". Укажите их в конфиге (generator.*) или через CLI."
+        )
+
+    # Seed (optional)
+    if "seed" in gen_cfg and gen_cfg["seed"] is not None:
+        try:
+            seed_val = int(gen_cfg["seed"])
+            random.seed(seed_val)
+            np.random.seed(seed_val)
+        except Exception:
+            pass
+
+    # Register the custom Cyrillic font
+    font_path = resolve_path(gen_cfg["font"])
+    pdfmetrics.registerFont(TTFont("CustomFont", str(font_path)))
+
+    # Build text generator
+    mode = llm_cfg.get("mode", "vllm")
+    # If no config and mode is vLLM, ensure model provided
+    if mode == "vllm" and not llm_cfg.get("model"):
+        raise SystemExit("Укажите модель через --model или в конфиге (llm.model) для режима vllm")
+
+    gen_text_fn = make_text_generator(mode, llm_cfg)
+
     generate_batch(
-        llm,
-        args.num,
-        pathlib.Path(args.signatures),
-        pathlib.Path(args.stamps),
-        pathlib.Path(args.out),
+        gen_text_fn,
+        int(gen_cfg.get("num", 1)),
+        resolve_path(gen_cfg["signatures_dir"]),
+        resolve_path(gen_cfg["stamps_dir"]),
+        resolve_path(gen_cfg["out_dir"]),
     )
 
 if __name__ == "__main__":

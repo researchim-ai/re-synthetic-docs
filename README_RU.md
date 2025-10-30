@@ -91,11 +91,19 @@ pip install -r requirements.txt
 
 2. **Генерация подписей** (опционально)
 
+   С использованием конфига (рекомендуется):
+
    ```bash
-   python make_signatures.py
+   python make_signatures.py --config config.example.json
    ```
 
-   — создаст \~500 PNG-подписей в `assets/signatures/png/`.
+   Быстрый запуск без файла (CLI перекрывает конфиг):
+
+   ```bash
+   python make_signatures.py --num 200
+   ```
+
+   Результат: PNG-подписи появятся в `assets/signatures/png/` (или каталоге из конфига).
 
 3. **Генерация печатей** (опционально)
 
@@ -112,21 +120,12 @@ pip install -r requirements.txt
 Запустите основную программу:
 
 ```bash
-python syntheticdocs.py \
-  --model     "/path/to/model-or-repo-id" \
-  --font      assets/signatures/fonts/YourCyrillicFont.ttf \
-  --signatures assets/signatures/png \
-  --stamps    assets/stamps/png \
-  --out       out \
-  -n          100
+python syntheticdocs.py --config config.example.json
 ```
 
-* `--model`      — Hugging Face repo-ID (например, `mistralai/Mistral-7B-Instruct-v0.2`) или локальный путь к модели
-* `--font`       — путь к `.ttf` шрифту с кириллицей
-* `--signatures` — директория с PNG-подписями (α-канал)
-* `--stamps`     — директория с PNG-печатью (α-канал)
-* `--out`        — выходная папка для датасета
-* `-n`           — число документов для генерации
+Все параметры берутся из `config.example.json`:
+* `llm.*` — режим и параметры LLM (включая OpenAI-совместимый API)
+* `generator.*` — шрифт, пути к подписям/печатьам, `out_dir`, количество `num`, `seed`
 
 **Структура выходной папки:**
 
@@ -156,6 +155,56 @@ out/
     ]
   }
   ```
+
+---
+
+## Конфигурация через JSON (LLM и подписи)
+
+Вы можете передать конфигурацию через JSON-файл (CLI-параметры перекрывают значения из конфига):
+
+```json
+{
+  "llm": {
+    "mode": "openai",
+    "base_url": "http://localhost:8000/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-4o-mini",
+    "max_tokens": 512,
+    "temperature": 0.7
+  },
+  "signatures": {
+    "fonts_dir": "assets/signatures/fonts",
+    "output_dir": "assets/signatures/png",
+    "num": 500,
+    "seed": 123,
+    "locale": "auto",
+    "font_size": { "min": 48, "max": 72 },
+    "padding": 20,
+    "rotation": { "min": -10, "max": 10 },
+    "border": { "min": 0, "max": 10 },
+    "blur": { "min": 0.0, "max": 0.8 }
+  }
+}
+```
+
+Запуск с конфигом:
+
+```bash
+python syntheticdocs.py --config config.example.json
+```
+
+Альтернатива без файла (CLI перекрывает конфиг, опционально):
+
+```bash
+python syntheticdocs.py \
+  --llm-mode openai \
+  --openai-base-url http://localhost:8000/v1 \
+  --openai-api-key $OPENAI_API_KEY \
+  --model gpt-4o-mini \
+  --font assets/signatures/fonts/YourCyrillicFont.ttf 
+```
+
+Параметры `--max-tokens` и `--temperature` работают в обоих режимах.
 
 ---
 
