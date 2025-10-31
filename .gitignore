@@ -173,5 +173,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 assets/signatures/fonts/
+assets/signatures/png/
 assets/stamp/fonts/
 out/
