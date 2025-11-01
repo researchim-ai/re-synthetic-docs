@@ -11,8 +11,8 @@
     "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "signatures_dir": "assets/signatures/png",
     "stamps_dir": "assets/stamps/png",
-    "out_dir": "out",
-    "num": 10,
+    "out_dir": "data",
+    "num": 100,
     "seed": 42
   },
   "signatures": {

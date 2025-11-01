@@ -176,3 +176,7 @@ assets/signatures/fonts/
 assets/signatures/png/
 assets/stamp/fonts/
 out/
+unsloth_cache/
+unsloth_compiled_cache/
+models/
+data/
