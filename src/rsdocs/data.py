@@ -38,3 +38,13 @@ def load_syntheticdocs(out_dir: str, max_samples: Optional[int] = None, max_char
     return data
 
 
+def load_split(root_dir: str, max_samples_train: Optional[int] = None, max_samples_test: Optional[int] = None,
+               max_chars: int = 4000) -> Dict[str, List[Dict[str, Any]]]:
+    """Загружает два набора: data/train и data/test внутри root_dir."""
+    train_dir = os.path.join(root_dir, "train")
+    test_dir = os.path.join(root_dir, "test")
+    train = load_syntheticdocs(train_dir, max_samples=max_samples_train, max_chars=max_chars) if os.path.isdir(train_dir) else []
+    test = load_syntheticdocs(test_dir, max_samples=max_samples_test, max_chars=max_chars) if os.path.isdir(test_dir) else []
+    return {"train": train, "test": test}
+
+

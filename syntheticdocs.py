@@ -6,7 +6,8 @@ import uuid
 import json
 import pathlib
 from datetime import datetime, timedelta
-from typing import List, Callable, Dict, Any
+from typing import List, Callable, Dict, Any, Iterable
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 from faker import Faker
 from huggingface_hub import snapshot_download
@@ -30,19 +31,61 @@ with open(SCRIPT_DIR / "prompts.json", encoding="utf-8") as f:
 DOC_TYPES = list(PROMPTS.keys())
 
 # ---------------------------------------------------------------------------
-# Augmentation pipeline
+# Augmentation pipeline (configurable)
 # ---------------------------------------------------------------------------
-aug = A.Compose([
-    A.Perspective(scale=(0.02, 0.05), p=0.5),
-    A.GaussianBlur(blur_limit=(1, 3), p=0.5),
-    A.ImageCompression(p=0.5),
-    A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
-])
+def build_augmentation(cfg: Dict[str, Any] | None) -> Any:
+    cfg = cfg or {}
+    # Defaults
+    persp = cfg.get("perspective", {"p": 0.5, "scale": [0.02, 0.05]})
+    blur  = cfg.get("gaussian_blur", {"p": 0.5, "blur_limit": [1, 3]})
+    comp  = cfg.get("compression", {"p": 0.5, "quality_range": [70, 100]})
+    noise = cfg.get("gauss_noise", {"p": 0.5, "var_limit": [10.0, 50.0]})
+    bc    = cfg.get("brightness_contrast", {"p": 0.4, "brightness_limit": 0.15, "contrast_limit": 0.15})
 
-def augment_image(img: Image.Image) -> Image.Image:
+    transforms = []
+    if (persp.get("p", 0) > 0):
+        transforms.append(A.Perspective(scale=tuple(persp.get("scale", [0.02, 0.05])), p=float(persp.get("p", 0.5))))
+    if (blur.get("p", 0) > 0):
+        transforms.append(A.GaussianBlur(blur_limit=tuple(blur.get("blur_limit", [1, 3])), p=float(blur.get("p", 0.5))))
+    if (comp.get("p", 0) > 0):
+        # Albumentations будет варьировать качество сама; параметр quality_range неявный, используем p как вероятность
+        transforms.append(A.ImageCompression(p=float(comp.get("p", 0.5))))
+    if (noise.get("p", 0) > 0):
+        # В некоторых версиях Albumentations параметр var_limit для GaussNoise помечается как устаревший/неподдерживаемый.
+        # Используем ISONoise как более стабильную альтернативу для имитации скан-шума.
+        transforms.append(A.ISONoise(
+            color_shift=(0.01, 0.05),
+            intensity=(0.05, 0.5),
+            p=float(noise.get("p", 0.5)),
+        ))
+    if (bc.get("p", 0) > 0):
+        transforms.append(A.RandomBrightnessContrast(
+            brightness_limit=float(bc.get("brightness_limit", 0.15)),
+            contrast_limit=float(bc.get("contrast_limit", 0.15)),
+            p=float(bc.get("p", 0.4)),
+        ))
+    if not transforms:
+        return None
+    # Включаем поддержку bbox (pascal_voc: [x1,y1,x2,y2])
+    return A.Compose(
+        transforms,
+        bbox_params=A.BboxParams(format="pascal_voc", label_fields=["bbox_labels"], min_visibility=0.0),
+    )
+
+def augment_image(
+    img: Image.Image,
+    aug_pipeline: Any | None,
+    bboxes: List[List[float]] | None = None,
+    bbox_labels: List[str] | None = None,
+) -> tuple[Image.Image, List[List[float]] | None, List[str] | None]:
+    if aug_pipeline is None:
+        return img, bboxes, bbox_labels
     arr = np.array(img)
-    arr2 = aug(image=arr)["image"]
-    return Image.fromarray(arr2)
+    if bboxes is None:
+        out = aug_pipeline(image=arr)
+        return Image.fromarray(out["image"]), None, None
+    out = aug_pipeline(image=arr, bboxes=bboxes, bbox_labels=bbox_labels or [])
+    return Image.fromarray(out["image"]), out.get("bboxes", []), out.get("bbox_labels", bbox_labels)
 
 # ---------------------------------------------------------------------------
 # Config + LLM helpers
@@ -89,6 +132,14 @@ def make_text_generator(mode: str, params: Dict[str, Any]) -> Callable[[str], st
             out = llm.generate([prompt], sampling)
             return out[0].outputs[0].text.strip()
 
+        def _gen_batch(prompts: List[str]) -> List[str]:
+            if not prompts:
+                return []
+            outs = llm.generate(prompts, sampling)
+            return [o.outputs[0].text.strip() for o in outs]
+
+        # прикрепляем батчевую версию как атрибут
+        _gen.batch = _gen_batch  # type: ignore[attr-defined]
         return _gen
 
     if mode == "openai":
@@ -123,6 +174,23 @@ def make_text_generator(mode: str, params: Dict[str, Any]) -> Callable[[str], st
             )
             return (resp.choices[0].message.content or "").strip()
 
+        def _gen_batch(prompts: List[str]) -> List[str]:
+            # Параллелим запросы к локальному OpenAI-совместимому серверу
+            max_workers = int(params.get("concurrency", 4))
+            if not prompts:
+                return []
+            results: List[str] = [""] * len(prompts)
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {ex.submit(_gen, p): i for i, p in enumerate(prompts)}
+                for fut in as_completed(futs):
+                    idx = futs[fut]
+                    try:
+                        results[idx] = fut.result()
+                    except Exception:
+                        results[idx] = ""
+            return results
+
+        _gen.batch = _gen_batch  # type: ignore[attr-defined]
         return _gen
 
     raise ValueError(f"Неизвестный режим LLM: {mode}")
@@ -130,14 +198,22 @@ def make_text_generator(mode: str, params: Dict[str, Any]) -> Callable[[str], st
 # ---------------------------------------------------------------------------
 # PDF rendering with signature & stamp
 # ---------------------------------------------------------------------------
-def draw_pdf(text: str, sig_png: str, stamp_png: str, out_pdf: str) -> (List[float], List[float]):
+def draw_pdf(text: str, sig_png: str, stamp_png: str, out_pdf: str, layout_cfg: Dict[str, Any] | None = None) -> (List[float], List[float]):
     w_pt, h_pt = A4
-    margin = 40
+    layout_cfg = layout_cfg or {}
+    margin_range = layout_cfg.get("margin_range", [30, 60])
+    font_size_range = layout_cfg.get("font_size_range", [11, 14])
+    leading_multiplier_range = layout_cfg.get("leading_multiplier_range", [1.1, 1.4])
+
+    margin = random.uniform(float(margin_range[0]), float(margin_range[1]))
+    font_size = random.uniform(float(font_size_range[0]), float(font_size_range[1]))
+    leading_mult = random.uniform(float(leading_multiplier_range[0]), float(leading_multiplier_range[1]))
     c = canvas.Canvas(out_pdf, pagesize=A4)
 
     # Draw body text
     txt = c.beginText(margin, h_pt - margin)
-    txt.setFont("CustomFont", 12)
+    txt.setFont("CustomFont", font_size)
+    txt.setLeading(font_size * leading_mult)
     for line in text.splitlines():
         txt.textLine(line if line.strip() else " ")
     c.drawText(txt)
@@ -151,19 +227,24 @@ def draw_pdf(text: str, sig_png: str, stamp_png: str, out_pdf: str) -> (List[flo
     sw_pt, sh_pt = sw_px * 72 / DPI, sh_px * 72 / DPI
     tw_pt, th_pt = tw_px * 72 / DPI, th_px * 72 / DPI
 
-    # Scale overlays to fit page
-    max_sw, max_sh = w_pt * 0.25, h_pt * 0.20
-    max_tw, max_th = w_pt * 0.30, h_pt * 0.30
+    # Scale overlays to fit page (allow random scale within range)
+    sig_scale_range = (layout_cfg.get("signature_scale_range", [0.15, 0.30]))
+    stp_scale_range = (layout_cfg.get("stamp_scale_range", [0.20, 0.35]))
+    max_sw, max_sh = w_pt * float(sig_scale_range[1]), h_pt * float(sig_scale_range[1])
+    max_tw, max_th = w_pt * float(stp_scale_range[1]), h_pt * float(stp_scale_range[1])
     scale_s = min(1, max_sw / sw_pt, max_sh / sh_pt)
     sw_pt, sh_pt = sw_pt * scale_s, sh_pt * scale_s
     scale_t = min(1, max_tw / tw_pt, max_th / th_pt)
     tw_pt, th_pt = tw_pt * scale_t, th_pt * scale_t
 
-    # Random positions
-    sig_x = random.uniform(margin, w_pt - margin - sw_pt)
-    sig_y = random.uniform(margin, h_pt * 0.25 - sh_pt)
-    st_x  = random.uniform(margin, w_pt * 0.35 - tw_pt)
-    st_y  = random.uniform(margin, h_pt * 0.35 - th_pt)
+    # Random positions (allow full-page ranges with inner margins)
+    pos_cfg = layout_cfg.get("positions", {})
+    sig_area = pos_cfg.get("signature_area", [0.05, 0.05, 0.95, 0.35])  # x1,y1,x2,y2 in [0..1]
+    st_area  = pos_cfg.get("stamp_area",     [0.05, 0.05, 0.45, 0.45])
+    sig_x = random.uniform(margin + sig_area[0]* (w_pt - 2*margin), margin + sig_area[2]* (w_pt - 2*margin) - sw_pt)
+    sig_y = random.uniform(margin + sig_area[1]* (h_pt - 2*margin), margin + sig_area[3]* (h_pt - 2*margin) - sh_pt)
+    st_x  = random.uniform(margin + st_area[0]* (w_pt - 2*margin),  margin + st_area[2]* (w_pt - 2*margin) - tw_pt)
+    st_y  = random.uniform(margin + st_area[1]* (h_pt - 2*margin),  margin + st_area[3]* (h_pt - 2*margin) - th_pt)
 
     # Draw with transparency
     c.drawImage(ImageReader(sig_png), sig_x, sig_y, sw_pt, sh_pt, mask="auto")
@@ -180,12 +261,70 @@ def draw_pdf(text: str, sig_png: str, stamp_png: str, out_pdf: str) -> (List[flo
 # ---------------------------------------------------------------------------
 # Main generation
 # ---------------------------------------------------------------------------
+def _render_worker_task(args: Dict[str, Any]) -> Dict[str, Any]:
+    # args: text, sigs, stamps, pdf_p, png_p, json_p, layout_cfg, augment_cfg, doc_type, uid
+    text: str = args["text"]
+    sigs: List[str] = args["sigs"]
+    stamps: List[str] = args["stamps"]
+    pdf_p: pathlib.Path = pathlib.Path(args["pdf_p"])  # type: ignore
+    png_p: pathlib.Path = pathlib.Path(args["png_p"])  # type: ignore
+    json_p: pathlib.Path = pathlib.Path(args["json_p"])  # type: ignore
+    layout_cfg: Dict[str, Any] | None = args.get("layout_cfg")
+    augment_cfg: Dict[str, Any] | None = args.get("augment_cfg")
+    doc_type: str = args.get("doc_type", "unknown")
+    uid: str = args["uid"]
+
+    sig_bbox, stamp_bbox = draw_pdf(
+        text,
+        str(random.choice(sigs)),
+        str(random.choice(stamps)),
+        str(pdf_p),
+        layout_cfg=layout_cfg,
+    )
+    # Конвертируем PDF→PNG и масштабируем bbox в пиксели
+    img = convert_from_path(str(pdf_p), dpi=300, first_page=1, last_page=1)[0]
+    w_pt, h_pt = A4
+    scale_x = img.width / float(w_pt)
+    scale_y = img.height / float(h_pt)
+    bboxes_px = [
+        [sig_bbox[0] * scale_x, sig_bbox[1] * scale_y, sig_bbox[2] * scale_x, sig_bbox[3] * scale_y],
+        [stamp_bbox[0] * scale_x, stamp_bbox[1] * scale_y, stamp_bbox[2] * scale_x, stamp_bbox[3] * scale_y],
+    ]
+    labels = ["signature", "stamp"]
+    # Применяем аугментации с трансформацией bbox
+    aug_pipeline = build_augmentation(augment_cfg)
+    img, bboxes_px_out, labels_out = augment_image(img, aug_pipeline, bboxes_px, labels)
+    img.save(png_p, "PNG")
+
+    # Если аугментаций не было, используем исходные ббоксы в пикселях
+    final_bboxes = bboxes_px_out if bboxes_px_out is not None else bboxes_px
+    final_labels = labels_out if labels_out is not None else labels
+
+    # Соберём JSON в исходном формате [{type, coords}]
+    bboxes_json = []
+    for lab, bb in zip(final_labels, final_bboxes):
+        bboxes_json.append({"type": lab, "coords": [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]})
+
+    meta = {
+        "id":    uid,
+        "type":  doc_type,
+        "text":  text,
+        "bboxes": bboxes_json,
+    }
+    json_p.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    return {"uid": uid, "doc_type": doc_type}
+
+
 def generate_batch(
     gen_text_fn: Callable[[str], str],
     n: int,
     sig_dir: pathlib.Path,
     stamp_dir: pathlib.Path,
     out_dir: pathlib.Path,
+    augment_cfg: Dict[str, Any] | None = None,
+    layout_cfg: Dict[str, Any] | None = None,
+    batch_size: int = 8,
+    render_workers: int | None = None,
 ):
     fake   = Faker("ru_RU")
     sigs   = list(sig_dir.glob("*.png"))
@@ -195,82 +334,131 @@ def generate_batch(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for i in range(n):
-        # Select document type and template
-        doc_type = random.choice(DOC_TYPES)
-        tpl      = PROMPTS[doc_type]
+    aug_pipeline = build_augmentation(augment_cfg)
 
-        # Generate fields
-        dt0 = datetime.today() - timedelta(days=random.randint(10, 60))
-        dt1 = dt0 + timedelta(days=random.randint(1, 10))
-        contract_dt = (dt0 - timedelta(days=random.randint(30, 365))).strftime("%d.%m.%Y")
+    i = 0
+    # Пул для рендера (CPU)
+    use_pool = render_workers is not None and int(render_workers) > 0
+    pool: ProcessPoolExecutor | None = None
+    if use_pool:
+        pool = ProcessPoolExecutor(max_workers=int(render_workers))
+    pending = []  # список future для рендеринга
+    while i < n:
+        # подготовим батч промптов и заготовок путей
+        batch_prompts: List[str] = []
+        batch_meta: List[Dict[str, Any]] = []
+        take = min(batch_size, n - i)
+        for _ in range(take):
+            # Select document type and template
+            doc_type = random.choice(DOC_TYPES)
+            tpl      = PROMPTS[doc_type]
 
-        fields = {
-            "number": f"{random.randint(1,99):02d}/{random.randint(1,999):03d}/"
-                      f"{random.randint(1,99):02d}/{random.randint(0,99):02d}",
-            "status": random.choice(["открыто", "закрыто"]),
-            "organization": fake.company(),
-            "department": random.choice([
-                "Контроль и диагностика в транспортных системах (авиация, автомобильные и железнодорожные)",
-                "Финансовый отдел",
-                "HR-отдел",
-                "Юридический отдел"
-            ]),
-            "date_receipt":  dt0.strftime("%d.%m.%Y"),
-            "date_dispatch": dt1.strftime("%d.%m.%Y"),
-            "address_sender":   fake.address().replace("\n", ", "),
-            "address_receiver": fake.address().replace("\n", ", "),
-            "name_sender":      fake.name(),
-            "name_receiver":    fake.name(),
-            "subject":          random.choice([
-                "Приемка оборудования",
-                "Акт сверки",
-                "Согласование договора",
-                "Запрос информации",
-                "Коммерческое предложение"
-            ]),
-            "content_instructions": (
-                f"Согласно договору № {random.randint(1,999):03d} от {contract_dt}, оборудование "
-                "должно прибыть в срок."
-            ),
-            "additional": "Добавить в конце «Резервная копия» и подготовить дополнительный штамп."
-        }
+            # Generate fields
+            dt0 = datetime.today() - timedelta(days=random.randint(10, 60))
+            dt1 = dt0 + timedelta(days=random.randint(1, 10))
+            contract_dt = (dt0 - timedelta(days=random.randint(30, 365))).strftime("%d.%m.%Y")
 
-        # Build prompt & generate
-        prompt = tpl.format(**fields)
-        body   = gen_text_fn(prompt)
+            fields = {
+                "number": f"{random.randint(1,99):02d}/{random.randint(1,999):03d}/"
+                          f"{random.randint(1,99):02d}/{random.randint(0,99):02d}",
+                "status": random.choice(["открыто", "закрыто"]),
+                "organization": fake.company(),
+                "department": random.choice([
+                    "Контроль и диагностика в транспортных системах (авиация, автомобильные и железнодорожные)",
+                    "Финансовый отдел",
+                    "HR-отдел",
+                    "Юридический отдел"
+                ]),
+                "date_receipt":  dt0.strftime("%d.%m.%Y"),
+                "date_dispatch": dt1.strftime("%d.%m.%Y"),
+                "address_sender":   fake.address().replace("\n", ", "),
+                "address_receiver": fake.address().replace("\n", ", "),
+                "name_sender":      fake.name(),
+                "name_receiver":    fake.name(),
+                "subject":          random.choice([
+                    "Приемка оборудования",
+                    "Акт сверки",
+                    "Согласование договора",
+                    "Запрос информации",
+                    "Коммерческое предложение"
+                ]),
+                "content_instructions": (
+                    f"Согласно договору № {random.randint(1,999):03d} от {contract_dt}, оборудование "
+                    "должно прибыть в срок."
+                ),
+                "additional": "Добавить в конце «Резервная копия» и подготовить дополнительный штамп."
+            }
 
-        # Paths
-        uid    = uuid.uuid4().hex
-        pdf_p  = out_dir / f"{uid}.pdf"
-        png_p  = out_dir / f"{uid}.png"
-        json_p = out_dir / f"{uid}.json"
+            prompt = tpl.format(**fields)
+            uid    = uuid.uuid4().hex
+            pdf_p  = out_dir / f"{uid}.pdf"
+            png_p  = out_dir / f"{uid}.png"
+            json_p = out_dir / f"{uid}.json"
 
-        # Render PDF + get bboxes
-        sig_bbox, stamp_bbox = draw_pdf(
-            body,
-            str(random.choice(sigs)),
-            str(random.choice(stamps)),
-            str(pdf_p)
-        )
-        # Convert → PNG + augment
-        img = convert_from_path(str(pdf_p), dpi=300, first_page=1, last_page=1)[0]
-        img = augment_image(img)
-        img.save(png_p, "PNG")
+            batch_prompts.append(prompt)
+            batch_meta.append({
+                "uid": uid,
+                "doc_type": doc_type,
+                "pdf_p": pdf_p,
+                "png_p": png_p,
+                "json_p": json_p,
+            })
 
-        # Save metadata
-        meta = {
-            "id":    uid,
-            "type":  doc_type,
-            "text":  body,
-            "bboxes": [
-                {"type": "signature", "coords": sig_bbox},
-                {"type": "stamp",     "coords": stamp_bbox},
-            ],
-        }
-        json_p.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        # сгенерируем батч текстов
+        if hasattr(gen_text_fn, "batch"):
+            bodies: List[str] = gen_text_fn.batch(batch_prompts)  # type: ignore[attr-defined]
+        else:
+            bodies = [gen_text_fn(p) for p in batch_prompts]
 
-        print(f"✔ [{i+1}/{n}] {doc_type} → {uid}")
+        # отрисуем и сохраним результаты
+        for k, body in enumerate(bodies):
+            meta_k = batch_meta[k]
+            task_args = {
+                "text": body,
+                "sigs": [str(p) for p in sigs],
+                "stamps": [str(p) for p in stamps],
+                "pdf_p": str(meta_k["pdf_p"]),
+                "png_p": str(meta_k["png_p"]),
+                "json_p": str(meta_k["json_p"]),
+                "layout_cfg": layout_cfg,
+                "augment_cfg": augment_cfg,
+                "doc_type": meta_k["doc_type"],
+                "uid": meta_k["uid"],
+            }
+            if pool is not None:
+                pending.append(pool.submit(_render_worker_task, task_args))
+            else:
+                res = _render_worker_task(task_args)
+                print(f"✔ [{i+1}/{n}] {res['doc_type']} → {res['uid']}")
+                i += 1
+
+        # если используем пул — частично дожидаемся результатов, чтобы поддерживать прогресс
+        if pool is not None:
+            # выгружаем не менее одной партии результатов
+            done_any = 0
+            new_pending = []
+            for fut in pending:
+                if fut.done():
+                    try:
+                        res = fut.result()
+                        print(f"✔ [{i+1}/{n}] {res['doc_type']} → {res['uid']}")
+                    except Exception:
+                        pass
+                    i += 1
+                    done_any += 1
+                else:
+                    new_pending.append(fut)
+            pending = new_pending
+
+    # Дождаться оставшихся задач пула
+    if pool is not None:
+        for fut in pending:
+            try:
+                res = fut.result()
+                print(f"✔ [{n}/{n}] {res['doc_type']} → {res['uid']}")
+            except Exception:
+                pass
+        pool.shutdown(wait=True)
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -403,6 +591,8 @@ def main():
         resolve_path(gen_cfg["signatures_dir"]),
         resolve_path(gen_cfg["stamps_dir"]),
         resolve_path(gen_cfg["out_dir"]),
+        augment_cfg=cfg.get("augment"),
+        layout_cfg=cfg.get("layout"),
     )
 
 if __name__ == "__main__":

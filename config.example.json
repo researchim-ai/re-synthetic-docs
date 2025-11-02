@@ -5,7 +5,8 @@
     "api_key": "OPENAI_API_KEY",
     "model": "Qwen3-30B-A3B-AWQ",
     "max_tokens": 8192,
-    "temperature": 0.7
+    "temperature": 0.7,
+    "batch_size": 8
   },
   "generator": {
     "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -15,6 +16,25 @@
     "num": 100,
     "seed": 42
   },
+  "augment": {
+    "perspective": { "p": 0.6, "scale": [0.01, 0.06] },
+    "gaussian_blur": { "p": 0.5, "blur_limit": [1, 5] },
+    "compression": { "p": 0.6, "quality_range": [70, 100] },
+    "gauss_noise": { "p": 0.6, "var_limit": [5.0, 60.0] },
+    "brightness_contrast": { "p": 0.4, "brightness_limit": 0.2, "contrast_limit": 0.2 }
+  },
+  "layout": {
+    "margin_range": [24, 64],
+    "font_size_range": [10.5, 14.5],
+    "leading_multiplier_range": [1.05, 1.5],
+    "signature_scale_range": [0.12, 0.32],
+    "stamp_scale_range": [0.18, 0.38],
+    "positions": {
+      "signature_area": [0.05, 0.05, 0.95, 0.45],
+      "stamp_area": [0.05, 0.05, 0.55, 0.55]
+    }
+  },
+  "notes": "Для ускорения добавьте llm.batch_size и generator.render_workers; для openai-режима можно указать llm.concurrency",
   "signatures": {
     "fonts_dir": "assets/signatures/fonts",
     "output_dir": "assets/signatures/png",
